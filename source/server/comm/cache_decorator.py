@@ -3,10 +3,37 @@ API响应缓存装饰器
 用于缓存频繁查询的API响应，提升性能
 """
 from functools import wraps
-from django.core.cache import cache
-from django.http import JsonResponse
 import hashlib
 import json
+
+from django.core.cache import cache
+from django.http import JsonResponse
+
+
+def _get_user_cache_identity(request):
+    """获取请求对应的用户缓存标识，防止跨用户缓存污染。"""
+    user = getattr(request, 'user', None)
+    if not user:
+        return 'anonymous'
+
+    if getattr(user, 'is_authenticated', False):
+        user_id = getattr(user, 'id', None)
+        if user_id is not None:
+            return f'user:{user_id}'
+        return f'user:{getattr(user, "username", "unknown")}'
+
+    return 'anonymous'
+
+
+def _safe_json_response_data(response):
+    """从JsonResponse中安全解析JSON数据，失败时返回None。"""
+    if not hasattr(response, 'content'):
+        return None
+
+    try:
+        return json.loads(response.content.decode('utf-8'))
+    except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+        return None
 
 def cache_api_response(timeout=300, key_prefix='api_cache'):
     """
@@ -25,6 +52,7 @@ def cache_api_response(timeout=300, key_prefix='api_cache'):
                 key_prefix,
                 request.path,
                 request.method,
+                _get_user_cache_identity(request),
             ]
             
             # 添加GET参数
@@ -48,14 +76,10 @@ def cache_api_response(timeout=300, key_prefix='api_cache'):
             
             # 只缓存成功的GET请求
             if request.method == 'GET' and hasattr(response, 'content'):
-                try:
-                    import json as json_module
-                    response_data = json_module.loads(response.content.decode('utf-8'))
-                    # 只缓存成功的响应
-                    if response_data.get('code') == 0:
-                        cache.set(full_cache_key, response_data, timeout)
-                except:
-                    pass  # 如果解析失败，不缓存
+                response_data = _safe_json_response_data(response)
+                # 只缓存成功的响应
+                if isinstance(response_data, dict) and response_data.get('code') == 0:
+                    cache.set(full_cache_key, response_data, timeout)
             
             return response
         
@@ -78,9 +102,11 @@ def cache_query_result(timeout=300, key_func=None):
             if key_func:
                 cache_key = key_func(request)
             else:
-                cache_key = f"query_cache:{request.path}:{request.method}"
+                cache_key = (
+                    f"query_cache:{request.path}:{request.method}:"
+                    f"{_get_user_cache_identity(request)}"
+                )
                 if request.GET:
-                    import json
                     cache_key += f":{json.dumps(dict(request.GET), sort_keys=True)}"
             
             # 尝试从缓存获取
@@ -94,17 +120,11 @@ def cache_query_result(timeout=300, key_func=None):
             
             # 缓存结果（只缓存GET请求的成功响应）
             if request.method == 'GET':
-                try:
-                    import json as json_module
-                    if hasattr(response, 'content'):
-                        response_data = json_module.loads(response.content.decode('utf-8'))
-                        if response_data.get('code') == 0:
-                            cache.set(cache_key, response_data.get('data'), timeout)
-                except:
-                    pass
+                response_data = _safe_json_response_data(response)
+                if isinstance(response_data, dict) and response_data.get('code') == 0:
+                    cache.set(cache_key, response_data.get('data'), timeout)
             
             return response
         
         return wrapper
     return decorator
-
